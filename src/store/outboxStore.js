@@ -1,0 +1,37 @@
+// Outbox 存储接口 + 工厂。
+//
+// item 形状：
+//   { id, requestId, charId, roundId, userId, content, error, createdAt }
+//
+// 实现：
+//   - Workers：KV（自带 expirationTtl，无需手动 sweep）          见 kvOutboxStore.js
+//   - Node 默认：内存 Map + 定时 sweep                          见 memoryOutboxStore.js
+//   - Node 持久（RELAY_STORE=sqlite）：better-sqlite3            见 sqliteOutboxStore.js
+//
+// TTL 默认 45 分钟（手机离线超过这个时长，结果会被清掉 → 丢失，可在环境里调大）。
+
+export const DEFAULT_TTL_MS = 45 * 60 * 1000;
+
+// 同时跟踪 requestId 去重：已处理过的 requestId 在 TTL 内拒绝重复 /generate（返回 409）。
+// 各实现内部维护一个 requestId→createdAt 的小表。
+
+export async function createOutboxStore(env) {
+    // Workers 环境：env.OUTBOX 是 KV 绑定
+    if (env && env.OUTBOX && typeof env.OUTBOX.put === 'function') {
+        const { KvOutboxStore } = await import('./kvOutboxStore.js');
+        return new KvOutboxStore(env.OUTBOX, env);
+    }
+
+    // Node 环境
+    const storeKind = (typeof process !== 'undefined' && process.env?.RELAY_STORE) || 'memory';
+    if (storeKind === 'sqlite') {
+        try {
+            const { SqliteOutboxStore } = await import('./sqliteOutboxStore.js');
+            return new SqliteOutboxStore(process.env.RELAY_SQLITE_PATH || './outbox.db');
+        } catch (e) {
+            console.warn('[outbox] sqlite 不可用，回退到内存:', e?.message);
+        }
+    }
+    const { MemoryOutboxStore } = await import('./memoryOutboxStore.js');
+    return new MemoryOutboxStore();
+}

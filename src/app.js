@@ -1,0 +1,183 @@
+// Hono app —— 一份代码，Workers 和 Node 共用。
+//
+// 路由：
+//   GET  /health                 健康检查（设置页测连接用）
+//   POST /generate               提交生成（fire-and-forget，202）
+//   GET  /outbox?inboxId=&since=  拉取已生成结果
+//   POST /ack                    确认并删除
+//   GET  /api/push/vapid-key     取 VAPID 公钥（复用 APP 现有订阅流程）
+//   POST /api/push/subscribe     注册推送订阅
+//   DELETE /api/push/unsubscribe 退订
+
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { requireSecret } from './util/auth.js';
+import { createOutboxStore } from './store/outboxStore.js';
+import { createSubStore } from './store/subStore.js';
+import { runGeneration } from './ai/aiCaller.js';
+import { dispatchPush } from './push/pushSender.js';
+import { getVapidPublicKey } from './push/webPush.js';
+import { makeMessageId, nowMs } from './util/ids.js';
+
+const VERSION = '1.0.0';
+
+export function createApp() {
+    const app = new Hono();
+
+    // 中继是用户自己的后端，APP 从套壳 (https://localhost / capacitor://localhost) 或
+    // 网页 (https://*.pages.dev) 跨域请求 → 放开 CORS（鉴权靠 Bearer secret，不靠 origin）。
+    app.use('*', cors({
+        origin: (o) => o || '*',
+        allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+        allowHeaders: ['Authorization', 'Content-Type'],
+    }));
+
+    // 每个请求懒初始化 store（Workers 每次 fetch 都新 env；Node 进程级缓存见下）
+    const stores = { outbox: null, sub: null };
+    async function getStores(env) {
+        if (env && env.OUTBOX) {
+            // Workers：KV 绑定每次都现取，store 实例无状态可重建
+            return {
+                outbox: await createOutboxStore(env),
+                sub: await createSubStore(env),
+            };
+        }
+        // Node：进程级单例
+        if (!stores.outbox) stores.outbox = await createOutboxStore(env);
+        if (!stores.sub) stores.sub = await createSubStore(env);
+        return stores;
+    }
+
+    app.get('/health', async (c) => {
+        const { outbox } = await getStores(c.env);
+        return c.json({ ok: true, store: outbox.kind || 'unknown', version: VERSION });
+    });
+
+    // 以下全部要鉴权
+    app.use('/generate', requireSecret);
+    app.use('/outbox', requireSecret);
+    app.use('/ack', requireSecret);
+    app.use('/api/push/subscribe', requireSecret);
+    app.use('/api/push/unsubscribe', requireSecret);
+
+    app.post('/generate', async (c) => {
+        let body;
+        try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+        const { requestId, inboxId, messages, settings, maxTokens, meta } = body || {};
+        if (!requestId || !inboxId || !Array.isArray(messages) || !settings) {
+            return c.json({ error: 'requestId / inboxId / messages / settings required' }, 400);
+        }
+
+        const { outbox, sub } = await getStores(c.env);
+
+        // 幂等：同 requestId 在 TTL 内只处理一次
+        if (await outbox.seenRequest(requestId)) {
+            return c.json({ duplicate: true, requestId }, 409);
+        }
+        await outbox.markRequest(requestId);
+
+        // 后台跑生成（不阻塞响应）。Workers 用 waitUntil 保证 fetch 返回后仍跑完。
+        const work = (async () => {
+            const id = makeMessageId(requestId);
+            let item;
+            try {
+                const content = await runGeneration(settings, messages, maxTokens);
+                item = {
+                    id, requestId,
+                    charId: meta?.charId ?? null,
+                    roundId: meta?.roundId ?? null,
+                    userId: meta?.userId ?? null,
+                    content, error: null, createdAt: nowMs(),
+                };
+            } catch (e) {
+                item = {
+                    id, requestId,
+                    charId: meta?.charId ?? null,
+                    roundId: meta?.roundId ?? null,
+                    userId: meta?.userId ?? null,
+                    content: null, error: String(e?.message || e), createdAt: nowMs(),
+                };
+            }
+            await outbox.put(inboxId, item);
+
+            // 发叫醒推送（best-effort，丢了靠手机轮询补）
+            try {
+                const subs = await sub.list(inboxId);
+                const payload = {
+                    title: '糯叽机',
+                    body: item.error ? '生成失败，点开查看' : '有新消息',
+                    charId: item.charId, userId: item.userId, kind: 'relay-outbox',
+                };
+                for (const s of subs) {
+                    const res = await dispatchPush(c.env, s, payload);
+                    if (res?.gone) await sub.remove(inboxId, s);
+                }
+            } catch (e) {
+                console.warn('[generate] push failed:', e?.message);
+            }
+        })();
+
+        // Workers：executionCtx.waitUntil 保证 fetch 返回后仍跑完；
+        // Node：没有 executionCtx（访问会抛），直接 fire-and-forget（长驻进程会自然跑完）。
+        try {
+            if (typeof c.executionCtx?.waitUntil === 'function') {
+                c.executionCtx.waitUntil(work);
+            } else {
+                work.catch((e) => console.warn('[generate] work failed:', e?.message));
+            }
+        } catch {
+            work.catch((e) => console.warn('[generate] work failed:', e?.message));
+        }
+
+        return c.json({ accepted: true, requestId }, 202);
+    });
+
+    app.get('/outbox', async (c) => {
+        const inboxId = c.req.query('inboxId');
+        const since = Number(c.req.query('since') || 0);
+        if (!inboxId) return c.json({ error: 'inboxId required' }, 400);
+        const { outbox } = await getStores(c.env);
+        const items = await outbox.list(inboxId, since);
+        return c.json({ items, now: nowMs() });
+    });
+
+    app.post('/ack', async (c) => {
+        let body;
+        try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+        const { inboxId, ids } = body || {};
+        if (!inboxId || !Array.isArray(ids)) return c.json({ error: 'inboxId / ids required' }, 400);
+        const { outbox } = await getStores(c.env);
+        const acked = await outbox.ack(inboxId, ids);
+        return c.json({ acked });
+    });
+
+    app.get('/api/push/vapid-key', async (c) => {
+        const publicKey = getVapidPublicKey(c.env);
+        if (!publicKey) return c.json({ error: 'VAPID not configured' }, 503);
+        return c.json({ publicKey });
+    });
+
+    app.post('/api/push/subscribe', async (c) => {
+        let body;
+        try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+        const { inboxId, subscription, channel } = body || {};
+        if (!inboxId || !subscription) return c.json({ error: 'inboxId / subscription required' }, 400);
+        const { sub } = await getStores(c.env);
+        // 默认 web 通道（PWA）；apns/fcm 由套壳显式带 channel
+        const entry = subscription.channel ? subscription : { channel: channel || 'web', sub: subscription };
+        await sub.add(inboxId, entry);
+        return c.json({ ok: true });
+    });
+
+    app.delete('/api/push/unsubscribe', async (c) => {
+        let body;
+        try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+        const { inboxId, subscription, endpoint } = body || {};
+        if (!inboxId) return c.json({ error: 'inboxId required' }, 400);
+        const { sub } = await getStores(c.env);
+        await sub.remove(inboxId, subscription || { endpoint });
+        return c.json({ ok: true });
+    });
+
+    return app;
+}
