@@ -56,51 +56,6 @@ export function createApp() {
         return c.json({ ok: true, store: outbox.kind || 'unknown', version: VERSION });
     });
 
-    // 🔧 临时调试端点：浏览器直接访问，验证 Worker 是否能写/读 KV + 出站请求是否可用。
-    //    GET /debug-ping  → 写一条测试 item 进 outbox(inboxId=debug) 再读回，返回结果。
-    //    确认链路后应删除。无需鉴权（仅诊断，不含敏感操作）。
-    app.get('/debug-ping', async (c) => {
-        const out = { version: VERSION, steps: {} };
-        try {
-            const { outbox } = await getStores(c.env);
-            out.steps.storeKind = outbox.kind;
-            const id = 'debug_' + nowMs();
-            await outbox.put('debug', { id, requestId: id, content: 'kv-write-ok', createdAt: nowMs() });
-            out.steps.kvPut = 'ok';
-            const items = await outbox.list('debug', 0);
-            out.steps.kvList = items.length;
-            await outbox.ack('debug', [id]);
-            out.steps.kvAck = 'ok';
-        } catch (e) {
-            out.steps.error = String(e?.message || e);
-        }
-        // 测出站请求（Worker 能不能访问外网，AI 调用的前提）
-        try {
-            const r = await fetch('https://api.openai.com/v1/models', { method: 'GET' });
-            out.steps.outboundFetch = `reachable (HTTP ${r.status})`;
-        } catch (e) {
-            out.steps.outboundFetch = 'FAILED: ' + String(e?.message || e);
-        }
-        return c.json(out);
-    });
-
-    // 🔧 临时调试：同步跑一次生成，把结果/完整错误直接返回（不走 waitUntil/outbox）。
-    //    POST 和 /generate 一样的 body。用来定位「202 成功但 outbox 空」= 后台 AI 调用为何无产出。
-    //    需 Bearer secret（会用到真 key）。确认后删除。
-    app.post('/debug-generate', requireSecret, async (c) => {
-        let body;
-        try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
-        const { messages, settings, maxTokens } = body || {};
-        if (!Array.isArray(messages) || !settings) return c.json({ error: 'messages/settings required' }, 400);
-        try {
-            const content = await runGeneration(settings, messages, maxTokens || null);
-            return c.json({ ok: true, contentPreview: String(content).slice(0, 300), len: String(content).length });
-        } catch (e) {
-            return c.json({ ok: false, error: String(e?.message || e), status: e?.status, detail: e?.detail });
-        }
-        return c.json(out);
-    });
-
     // 以下全部要鉴权
     app.use('/generate', requireSecret);
     app.use('/outbox', requireSecret);
@@ -146,9 +101,6 @@ export function createApp() {
             };
         }
         await outbox.put(inboxId, item);
-        // 🔧 诊断：写入后立即自查一次，确认 put 真的进了同一 inbox（排查 inboxId 不匹配/KV 写入失败）
-        let _selfCheck = -1;
-        try { _selfCheck = (await outbox.list(inboxId, 0)).length; } catch { /* ignore */ }
 
         // 发叫醒推送（best-effort，丢了靠手机轮询补）。推送可放 waitUntil（轻量，丢了也无妨）。
         const pushWork = (async () => {
@@ -173,8 +125,7 @@ export function createApp() {
         } catch { pushWork.catch(() => {}); }
 
         // outbox 已写入，返回（手机轮询会拉到）。202 语义保留。
-        // _selfCheck = 写入后自查同 inbox 的条数；inboxId 回显用于对比手机查询的 inboxId。
-        return c.json({ accepted: true, requestId, generated: !item.error, inboxId, selfCheck: _selfCheck, itemId: id, err: item.error || null }, 202);
+        return c.json({ accepted: true, requestId, generated: !item.error }, 202);
     });
 
     app.get('/outbox', async (c) => {
